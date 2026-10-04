@@ -24,5 +24,10 @@ ENV PATH=/home/reclip/.local/bin:$PATH
 
 EXPOSE 8899
 
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8899/api/v1/health', timeout=5)" || exit 1
+
 ENTRYPOINT ["sh", "/app/docker-entrypoint.sh"]
-CMD ["gunicorn", "-b", "0.0.0.0:8899", "-w", "1", "--threads", "4", "--timeout", "600", "--access-logfile", "-", "app:app"]
+# One worker process (jobs and the download pool live in it); threads serve
+# requests, including agents that block on ?wait=.
+CMD ["gunicorn", "-b", "0.0.0.0:8899", "-w", "1", "--threads", "16", "--timeout", "600", "--access-logfile", "-", "app:app"]

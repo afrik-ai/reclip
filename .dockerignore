@@ -13,3 +13,6 @@ Dockerfile
 .env.*
 .vscode
 .idea
+tests
+.github
+docs

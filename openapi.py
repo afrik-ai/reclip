@@ -21,6 +21,7 @@ _ERROR = {
                         "unsupported_url", "login_required", "geo_restricted", "age_restricted",
                         "rate_limited", "unavailable", "network_error", "timeout", "too_long",
                         "too_large", "download_failed", "interrupted", "internal_error",
+                        "invalid_language", "transcription_unavailable", "transcription_failed",
                     ],
                 },
                 "message": {"type": "string"},
@@ -56,6 +57,35 @@ _JOB = {
 }
 
 
+_TRANSCRIPT = {
+    "type": "object",
+    "properties": {
+        "download_id": {"type": "string"},
+        "status": {"type": "string", "enum": ["pending", "queued", "transcribing", "done", "error"],
+                   "description": "'pending' = waiting for the download to finish"},
+        "progress": {"type": ["number", "null"], "description": "0-100"},
+        "language": {"type": ["string", "null"], "description": "Detected (or requested) language code"},
+        "duration": {"type": ["number", "null"], "description": "Audio length in seconds"},
+        "model": {"type": ["string", "null"], "description": "Whisper model used"},
+        "text": {"type": "string", "description": "The transcript, one line per segment (when done)"},
+        "files": {
+            "type": "object",
+            "description": "Signed links (no API key needed): txt, srt and vtt subtitles, "
+                           "and json with per-segment timestamps",
+            "properties": {k: {"type": "string"} for k in ("txt", "srt", "vtt", "json")},
+        },
+        "created_at": {"type": ["string", "null"], "format": "date-time"},
+        "finished_at": {"type": ["string", "null"], "format": "date-time"},
+        "error": {"oneOf": [{"type": "null"}, _ERROR["properties"]["error"]]},
+    },
+}
+
+_JOB["properties"]["transcript"] = {
+    "$ref": "#/components/schemas/Transcript",
+    "description": "Present when the download was created with transcribe=true",
+}
+
+
 def _err(desc):
     return {"description": desc, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}
 
@@ -63,6 +93,7 @@ def _err(desc):
 def build_openapi(server_url, version):
     job_ref = {"$ref": "#/components/schemas/Download"}
     job_resp = {"content": {"application/json": {"schema": job_ref}}}
+    transcript_resp = {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/Transcript"}}}}
     return {
         "openapi": "3.1.0",
         "info": {
@@ -72,14 +103,16 @@ def build_openapi(server_url, version):
                 "Download video (MP4) or audio (MP3) from YouTube, TikTok, Instagram, X/Twitter "
                 "and 1000+ other sites supported by yt-dlp. Typical flow: POST /api/v1/downloads "
                 "with wait=60, then fetch file_url from the response. If status is still "
-                "'queued' or 'downloading', call GET /api/v1/downloads/{id}?wait=60 until done."
+                "'queued' or 'downloading', call GET /api/v1/downloads/{id}?wait=60 until done. "
+                "For a transcript of the speech, add transcribe=true (and format=mp3), then poll "
+                "GET /api/v1/downloads/{id}/transcript?wait=60 until its status is 'done'."
             ),
         },
         "servers": [{"url": server_url}],
         "security": [{"bearerAuth": []}],
         "components": {
             "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}},
-            "schemas": {"Download": _JOB, "Error": _ERROR},
+            "schemas": {"Download": _JOB, "Transcript": _TRANSCRIPT, "Error": _ERROR},
         },
         "paths": {
             "/api/v1/downloads": {
@@ -101,6 +134,11 @@ def build_openapi(server_url, version):
                                          "description": "Seconds to wait for completion before responding (server caps this)"},
                                 "reuse": {"type": "boolean", "default": True,
                                           "description": "Return an earlier identical download if its file still exists"},
+                                "transcribe": {"type": "boolean", "default": False,
+                                               "description": "Also transcribe the speech (Whisper). Use "
+                                                              "format=mp3 when only the transcript is needed"},
+                                "language": {"type": "string", "default": "auto",
+                                             "description": "Transcript language code, e.g. 'en'; 'auto' detects it"},
                             },
                         }}},
                     },
@@ -148,6 +186,39 @@ def build_openapi(server_url, version):
                     "responses": {"200": {"description": "The media file",
                                           "content": {"application/octet-stream": {}}},
                                   "409": _err("Not finished yet"), "410": _err("Expired or failed")},
+                },
+            },
+            "/api/v1/downloads/{id}/transcript": {
+                "post": {
+                    "operationId": "createTranscript",
+                    "summary": "Transcribe the speech in a download (works while it is still downloading)",
+                    "parameters": [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}],
+                    "requestBody": {"content": {"application/json": {"schema": {
+                        "type": "object",
+                        "properties": {
+                            "language": {"type": "string", "default": "auto"},
+                            "wait": {"type": "number", "default": 0,
+                                     "description": "Seconds to wait for the transcript (server caps this)"},
+                            "reuse": {"type": "boolean", "default": True},
+                            "include_text": {"type": "boolean", "default": True},
+                        },
+                    }}}},
+                    "responses": {"200": {"description": "Finished (done or error)", **transcript_resp},
+                                  "202": {"description": "Accepted; still running", **transcript_resp},
+                                  "404": _err("No such download"),
+                                  "409": _err("Download failed or another transcript is running"),
+                                  "501": _err("Transcription is not installed on this server")},
+                },
+                "get": {
+                    "operationId": "getTranscript",
+                    "summary": "Get a transcript, optionally waiting for it to finish",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": True, "schema": {"type": "string"}},
+                        {"name": "wait", "in": "query", "schema": {"type": "number", "default": 0}},
+                        {"name": "include_text", "in": "query", "schema": {"type": "boolean", "default": True}},
+                    ],
+                    "responses": {"200": {"description": "Transcript", **transcript_resp},
+                                  "404": _err("No transcript requested for this download")},
                 },
             },
             "/api/v1/info": {

@@ -15,6 +15,7 @@ Run:  python mcp_server.py            (stdio, for Claude Desktop / Claude Code)
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,6 +38,9 @@ Reddit, Vimeo, SoundCloud and 1000+ other sites.
 - On "error", error.code says why (e.g. login_required, unsupported_url,
   geo_restricted, too_long). Don't retry those unchanged; tell the user.
 - For playlists/channels, call expand_playlist first, then download items.
+- For a transcript (what is said in a video/audio), call transcribe with the URL
+  (or the id of a finished download). If status is not yet "done", call
+  get_transcript with the id until it is. language is auto-detected unless given.
 """
 
 
@@ -80,6 +84,26 @@ class LocalBackend:
     def list(self, limit):
         return {"downloads": [self._job(j) for j in self.engine.list("mcp", limit)]}
 
+    def _transcript(self, transcript, max_chars):
+        from core import public_transcript
+
+        job_id = transcript["job_id"]
+        if transcript["status"] != "done":
+            return public_transcript(transcript)
+        return public_transcript(transcript, self.engine.read_transcript_text(job_id),
+                                 files=self.engine.transcript_paths(job_id), max_chars=max_chars)
+
+    def transcribe(self, url, job_id, language, wait, max_chars):
+        deadline = time.time() + wait
+        if url:
+            job_id = self.engine.submit(url, fmt="mp3", owner="mcp")["id"]
+        self.engine.request_transcript(job_id, "mcp", language)
+        transcript = self.engine.wait_transcript(job_id, max(0.0, deadline - time.time()), "mcp")
+        return self._transcript(transcript, max_chars)
+
+    def get_transcript(self, job_id, wait, max_chars):
+        return self._transcript(self.engine.wait_transcript(job_id, wait, "mcp"), max_chars)
+
 
 class RemoteBackend:
     def __init__(self, base_url, api_key):
@@ -120,6 +144,34 @@ class RemoteBackend:
 
     def list(self, limit):
         return self._call("GET", f"/api/v1/downloads?limit={int(limit)}")
+
+    @staticmethod
+    def _truncate(result, max_chars):
+        text = result.get("text")
+        if isinstance(text, str) and max_chars and len(text) > max_chars:
+            result["text"] = text[:max_chars]
+            result["text_truncated"] = True
+        return result
+
+    def transcribe(self, url, job_id, language, wait, max_chars):
+        payload = {"language": language, "wait": wait}
+        if url:
+            result = self._call("POST", "/api/v1/downloads",
+                                {"url": url, "format": "mp3", "transcribe": True, **payload},
+                                timeout=wait + 30)
+            if "transcript" not in result:
+                return result  # an error from the download
+            result = result["transcript"]
+        else:
+            result = self._call("POST", f"/api/v1/downloads/{urllib.parse.quote(job_id)}/transcript",
+                                payload, timeout=wait + 30)
+        return self._truncate(result, max_chars)
+
+    def get_transcript(self, job_id, wait, max_chars):
+        q = urllib.parse.urlencode({"wait": wait})
+        return self._truncate(
+            self._call("GET", f"/api/v1/downloads/{urllib.parse.quote(job_id)}/transcript?{q}",
+                       timeout=wait + 30), max_chars)
 
 
 def make_backend():
@@ -170,6 +222,27 @@ def build_server(backend=None):
     async def expand_playlist(url: str, limit: int = 25) -> dict:
         """List the individual video URLs (with titles) in a playlist or channel URL."""
         return await run(backend.playlist, url, max(1, int(limit)))
+
+    @server.tool()
+    async def transcribe(url: str = "", id: str = "", language: str = "auto",
+                         wait_seconds: int = 90, max_chars: int = 50000) -> dict:
+        """Transcribe what is said in a video or audio, using Whisper speech-to-text.
+
+        Pass url (any page download_media accepts; only the audio is downloaded) or the id
+        of a finished download. language: "auto" or a code like "en", "fr", "es".
+        Returns status, language, duration and, when done, the transcript text plus
+        subtitle files (txt, srt, vtt, json with timestamps). If status is not "done",
+        call get_transcript with download_id. text is cut to max_chars (text_truncated).
+        """
+        if bool(url) == bool(id):
+            return {"error": {"code": "invalid_request", "message": "Pass either url or id"}}
+        return await run(backend.transcribe, url, id, language, max(0, int(wait_seconds)),
+                         max(0, int(max_chars)))
+
+    @server.tool()
+    async def get_transcript(id: str, wait_seconds: int = 60, max_chars: int = 50000) -> dict:
+        """Check a transcript started by transcribe, waiting up to wait_seconds for it to finish."""
+        return await run(backend.get_transcript, id, max(0, int(wait_seconds)), max(0, int(max_chars)))
 
     @server.tool()
     async def list_downloads(limit: int = 20) -> dict:

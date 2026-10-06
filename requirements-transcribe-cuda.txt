@@ -1,0 +1,6 @@
+# Optional, on top of requirements-transcribe.txt: run Whisper on an NVIDIA GPU.
+# Supplies the CUDA 12 cuBLAS and cuDNN 9 libraries faster-whisper needs, so you
+# don't have to install the CUDA toolkit. Only an up-to-date NVIDIA driver is required.
+-r requirements-transcribe.txt
+nvidia-cublas-cu12
+nvidia-cudnn-cu12==9.*

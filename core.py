@@ -8,6 +8,7 @@ REST API (app.py) and the MCP server (mcp_server.py) share one implementation:
 * URL validation that refuses private/internal addresses (SSRF guard)
 * structured, machine-readable error codes instead of raw stderr
 * automatic expiry of downloaded files
+* optional transcripts of downloaded media (Whisper, see transcribe.py)
 """
 
 import glob
@@ -31,6 +32,7 @@ from urllib.parse import urlparse
 FORMATS = {"mp4", "mp3"}
 FORMAT_ALIASES = {"video": "mp4", "audio": "mp3", "mp4": "mp4", "mp3": "mp3"}
 ACTIVE_STATUSES = ("queued", "downloading")
+TRANSCRIPT_ACTIVE = ("pending", "queued", "transcribing")
 
 
 # --------------------------------------------------------------------------- #
@@ -69,6 +71,9 @@ class Settings:
     secret: str = ""
     public_url: str = ""
     enable_ui: bool = True
+    whisper_model: str = "turbo"
+    whisper_device: str = "auto"  # auto | cuda | cpu
+    whisper_compute_type: str = "auto"  # auto = float16 on GPU, int8 on CPU
 
     @classmethod
     def from_env(cls):
@@ -92,6 +97,10 @@ class Settings:
         # The web UI has no login, so once API keys are set it would be an
         # unauthenticated side door. Keep it off unless explicitly enabled.
         s.enable_ui = _env_bool("RECLIP_ENABLE_UI", not s.api_keys)
+        s.whisper_model = os.environ.get("RECLIP_WHISPER_MODEL", s.whisper_model).strip() or s.whisper_model
+        s.whisper_device = os.environ.get("RECLIP_WHISPER_DEVICE", s.whisper_device).strip().lower() or "auto"
+        s.whisper_compute_type = (os.environ.get("RECLIP_WHISPER_COMPUTE_TYPE", s.whisper_compute_type)
+                                  .strip() or "auto")
         return s
 
 
@@ -198,6 +207,16 @@ def normalize_quality(quality):
     raise ReclipError("invalid_quality", "quality must be 'best' or a height such as 1080, 720, 480")
 
 
+def normalize_language(language):
+    """None/'auto' for auto-detect, else a Whisper language code such as 'en' or 'fr'."""
+    if language in (None, "", "auto"):
+        return None
+    text = str(language).strip().lower()
+    if re.fullmatch(r"[a-z]{2,3}", text):
+        return text
+    raise ReclipError("invalid_language", "language must be 'auto' or a code such as 'en', 'fr', 'es'")
+
+
 def parse_ytdlp_json(stdout):
     """Parse yt-dlp JSON output.
 
@@ -240,6 +259,12 @@ class JobStore:
                 expires_at REAL)"""
         )
         self._db.execute("CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, created_at)")
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS transcripts (
+                job_id TEXT PRIMARY KEY, status TEXT, progress REAL, language_requested TEXT,
+                language TEXT, model TEXT, device TEXT, duration REAL, error_code TEXT,
+                error_message TEXT, created_at REAL, started_at REAL, finished_at REAL)"""
+        )
 
     def insert(self, job):
         cols = ",".join(_COLUMNS)
@@ -259,6 +284,21 @@ class JobStore:
             row = self._db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return dict(row) if row else None
 
+    def get_transcript(self, job_id):
+        rows = self.query("SELECT * FROM transcripts WHERE job_id=?", (job_id,))
+        return rows[0] if rows else None
+
+    def put_transcript(self, row):
+        cols = ",".join(row)
+        marks = ",".join("?" for _ in row)
+        with self._lock:
+            self._db.execute(f"INSERT OR REPLACE INTO transcripts ({cols}) VALUES ({marks})", list(row.values()))
+
+    def update_transcript(self, job_id, **fields):
+        sets = ",".join(f"{k}=?" for k in fields)
+        with self._lock:
+            self._db.execute(f"UPDATE transcripts SET {sets} WHERE job_id=?", [*fields.values(), job_id])
+
     def query(self, sql, params=()):
         with self._lock:
             return [dict(r) for r in self._db.execute(sql, params).fetchall()]
@@ -276,13 +316,17 @@ _PROGRESS_PREFIX = "[reclip-progress]"
 
 
 class Engine:
-    def __init__(self, settings=None, start_janitor=True):
+    def __init__(self, settings=None, start_janitor=True, transcriber=None):
         self.settings = settings or Settings.from_env()
         os.makedirs(self.settings.download_dir, exist_ok=True)
         self.store = JobStore(os.path.join(self.settings.download_dir, "jobs.db"))
         self.secret = self.settings.secret or self._load_or_create_secret()
         self._pool = ThreadPoolExecutor(max_workers=max(1, self.settings.max_concurrent),
                                         thread_name_prefix="reclip-dl")
+        # Transcription saturates a GPU (or every CPU core), so run one at a time.
+        self._transcribe_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="reclip-stt")
+        self._transcriber = transcriber
+        self._transcript_lock = threading.Lock()
         self._changed = threading.Condition()
         self._submit_lock = threading.Lock()
         # Jobs that were running when the process died will never finish.
@@ -290,6 +334,12 @@ class Engine:
             "UPDATE jobs SET status='error', error_code='interrupted', "
             "error_message='Server restarted before the download finished; please retry', "
             "finished_at=? WHERE status IN ('queued','downloading')",
+            (time.time(),),
+        )
+        self.store.execute(
+            "UPDATE transcripts SET status='error', error_code='interrupted', "
+            "error_message='Server restarted before the transcript finished; please retry', "
+            "finished_at=? WHERE status IN ('pending','queued','transcribing')",
             (time.time(),),
         )
         self.cleanup_expired()
@@ -327,7 +377,8 @@ class Engine:
                                    text=True, timeout=15).stdout.strip() or None
         except Exception:
             ytdlp = None
-        return {"yt_dlp": ytdlp, "ffmpeg": bool(shutil.which("ffmpeg"))}
+        return {"yt_dlp": ytdlp, "ffmpeg": bool(shutil.which("ffmpeg")),
+                "transcription": self.transcription_available()}
 
     # -- info / playlist --------------------------------------------------- #
 
@@ -472,8 +523,160 @@ class Engine:
         job = self.get(job_id, owner)
         if job["status"] in ACTIVE_STATUSES:
             raise ReclipError("job_active", "Download is still running", http_status=409)
+        transcript = self.store.get_transcript(job_id)
+        if transcript and transcript["status"] in TRANSCRIPT_ACTIVE:
+            raise ReclipError("job_active", "Transcript is still running", http_status=409)
         self._remove_files(job_id)
+        self.store.execute("DELETE FROM transcripts WHERE job_id=?", (job_id,))
         self.store.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+    # -- transcripts ------------------------------------------------------- #
+
+    def transcription_available(self):
+        if self._transcriber is not None:
+            return True
+        import transcribe
+
+        return transcribe.is_available()
+
+    def _get_transcriber(self):
+        if self._transcriber is None:
+            import transcribe
+
+            s = self.settings
+            self._transcriber = transcribe.Transcriber(s.whisper_model, s.whisper_device,
+                                                       s.whisper_compute_type)
+        return self._transcriber
+
+    def request_transcript(self, job_id, owner=None, language=None, reuse=True):
+        """Start (or reuse) a transcript of a download.
+
+        Works on a download that is still running too: the transcript waits as
+        "pending" and starts as soon as the file is ready.
+        """
+        language = normalize_language(language)
+        if not self.transcription_available():
+            raise ReclipError(
+                "transcription_unavailable",
+                "Transcription isn't installed on this server "
+                "(pip install -r requirements-transcribe.txt)",
+                http_status=501,
+            )
+        with self._transcript_lock:
+            job = self.get(job_id, owner)
+            if job["status"] not in ("done", *ACTIVE_STATUSES):
+                raise ReclipError("not_ready", f"Download is not available (status: {job['status']})",
+                                  http_status=410 if job["status"] == "expired" else 409)
+            existing = self.store.get_transcript(job_id)
+            if existing:
+                same_language = language in (None, existing["language_requested"], existing["language"])
+                if existing["status"] in TRANSCRIPT_ACTIVE:
+                    if not same_language:
+                        raise ReclipError("job_active", "A transcript in another language is still running",
+                                          http_status=409)
+                    return existing
+                if reuse and existing["status"] == "done" and same_language and \
+                        os.path.exists(self.transcript_paths(job_id)["txt"]):
+                    return existing
+            now = time.time()
+            ready = job["status"] == "done"
+            self.store.put_transcript({
+                "job_id": job_id, "status": "queued" if ready else "pending", "progress": 0.0,
+                "language_requested": language, "language": None, "model": None, "device": None,
+                "duration": None, "error_code": None, "error_message": None, "created_at": now,
+                "started_at": None, "finished_at": None,
+            })
+            if ready:
+                self._transcribe_pool.submit(self._run_transcript, job_id)
+        self._notify()
+        return self.store.get_transcript(job_id)
+
+    def get_transcript(self, job_id, owner=None):
+        self.get(job_id, owner)  # ownership check
+        transcript = self.store.get_transcript(job_id)
+        if not transcript:
+            raise ReclipError("not_found", "No transcript for this download; request one first",
+                              http_status=404)
+        return transcript
+
+    def wait_transcript(self, job_id, timeout, owner=None):
+        deadline = time.time() + max(0, min(float(timeout or 0), self.settings.max_wait))
+        transcript = self.get_transcript(job_id, owner)
+        while transcript["status"] in TRANSCRIPT_ACTIVE:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            with self._changed:
+                self._changed.wait(timeout=min(remaining, 1.0))
+            transcript = self.get_transcript(job_id, owner)
+        return transcript
+
+    def transcript_paths(self, job_id):
+        import transcribe
+
+        return {fmt: os.path.join(self._job_dir(job_id), f"transcript.{fmt}")
+                for fmt in transcribe.TRANSCRIPT_FORMATS}
+
+    def read_transcript_text(self, job_id):
+        try:
+            with open(self.transcript_paths(job_id)["txt"], encoding="utf-8") as f:
+                return f.read().rstrip("\n")
+        except OSError:
+            return None
+
+    def _download_finished(self, job_id):
+        """Start or fail any transcript that was waiting on this download."""
+        with self._transcript_lock:
+            transcript = self.store.get_transcript(job_id)
+            if not transcript or transcript["status"] != "pending":
+                return
+            job = self.store.get(job_id)
+            if job and job["status"] == "done":
+                self.store.update_transcript(job_id, status="queued")
+                self._transcribe_pool.submit(self._run_transcript, job_id)
+            else:
+                # Pass the download's own error on: "login_required" says more than "failed".
+                self.store.update_transcript(
+                    job_id, status="error", error_code=(job or {}).get("error_code") or "download_failed",
+                    error_message="The download failed, so there is nothing to transcribe: "
+                                  + ((job or {}).get("error_message") or "unknown error"),
+                    finished_at=time.time())
+
+    def _run_transcript(self, job_id):
+        import transcribe
+
+        transcript = self.store.get_transcript(job_id)
+        job = self.store.get(job_id)
+        if not transcript or transcript["status"] != "queued":
+            return
+        fields = {}
+        try:
+            if not job or job["status"] != "done" or not job["file_path"] or \
+                    not os.path.exists(job["file_path"]):
+                raise ReclipError("not_ready", "The downloaded file is no longer available")
+            transcriber = self._get_transcriber()
+            self.store.update_transcript(job_id, status="transcribing", started_at=time.time(),
+                                         model=getattr(transcriber, "model_name", None))
+            self._notify()
+            last = [0.0]
+
+            def on_progress(pct):
+                if time.time() - last[0] > 0.5:
+                    last[0] = time.time()
+                    self.store.update_transcript(job_id, progress=pct)
+                    self._notify()
+
+            result = transcriber.transcribe(job["file_path"], transcript["language_requested"], on_progress)
+            transcribe.write_outputs(result, self._job_dir(job_id))
+            fields = {"status": "done", "progress": 100.0, "language": result["language"],
+                      "duration": result["duration"], "device": getattr(transcriber, "device", None)}
+        except ReclipError as e:
+            fields = {"status": "error", "error_code": e.code, "error_message": e.message}
+        except Exception as e:  # never leave a transcript stuck in "transcribing"
+            fields = {"status": "error", "error_code": "transcription_failed", "error_message": str(e)}
+        fields["finished_at"] = time.time()
+        self.store.update_transcript(job_id, **fields)
+        self._notify()
 
     # -- signed file links ------------------------------------------------- #
 
@@ -553,6 +756,7 @@ class Engine:
             fields = {"status": "error", "error_code": "internal_error", "error_message": str(e)}
         fields["finished_at"] = time.time()
         self.store.update(job_id, **fields)
+        self._download_finished(job_id)
         self._notify()
 
     def _download(self, job, out_dir):
@@ -620,7 +824,7 @@ class Engine:
         matching = [f for f in files if f.lower().endswith(want)]
         chosen = os.path.abspath(matching[0] if matching else files[0])
         for f in glob.glob(os.path.join(out_dir, "*")):
-            if os.path.abspath(f) != chosen:
+            if os.path.abspath(f) != chosen and not os.path.basename(f).startswith("transcript."):
                 try:
                     os.remove(f)
                 except OSError:
@@ -646,11 +850,13 @@ class Engine:
         for row in expired:
             self._remove_files(row["id"])
             self.store.update(row["id"], status="expired", file_path=None)
+            self.store.execute("DELETE FROM transcripts WHERE job_id=?", (row["id"],))
         # Forget failed/expired job records after a week.
         self.store.execute(
             "DELETE FROM jobs WHERE status IN ('error','expired') AND created_at < ?",
             (now - 7 * 24 * 3600,),
         )
+        self.store.execute("DELETE FROM transcripts WHERE job_id NOT IN (SELECT id FROM jobs)")
         return len(expired)
 
     def _janitor(self):
@@ -702,6 +908,32 @@ def public_job(job, file_url=None):
         out["file_url"] = file_url
     if job.get("cached"):
         out["cached"] = True
+    return out
+
+
+def public_transcript(transcript, text=None, files=None, max_chars=None):
+    """The transcript shape returned to API and MCP clients."""
+    out = {
+        "download_id": transcript["job_id"],
+        "status": transcript["status"],
+        "progress": transcript["progress"],
+        "language": transcript["language"] or transcript["language_requested"],
+        "duration": transcript["duration"],
+        "model": transcript["model"],
+        "created_at": _iso(transcript["created_at"]),
+        "finished_at": _iso(transcript["finished_at"]),
+        "error": ({"code": transcript["error_code"], "message": transcript["error_message"]}
+                  if transcript["status"] == "error" else None),
+    }
+    if transcript["status"] == "done":
+        if text is not None:
+            if max_chars and len(text) > max_chars:
+                out["text"] = text[:max_chars]
+                out["text_truncated"] = True
+            else:
+                out["text"] = text
+        if files:
+            out["files"] = files
     return out
 
 

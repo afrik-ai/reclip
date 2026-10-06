@@ -47,6 +47,8 @@ To use a ReClip server you host elsewhere instead, add to the server's `env`:
 | `get_media_info(url)` | Title, uploader, duration, available qualities; no download |
 | `expand_playlist(url, limit=25)` | Individual video URLs in a playlist or channel |
 | `list_downloads(limit=20)` | Recent downloads |
+| `transcribe(url=… or id=…, language="auto", wait_seconds=90, max_chars=50000)` | Downloads the audio if needed and returns what is said, plus txt/srt/vtt/json files. See [Transcripts](#transcripts) |
+| `get_transcript(id, wait_seconds=60, max_chars=50000)` | Checks, or keeps waiting on, a transcript |
 
 ## 2. REST API
 
@@ -95,6 +97,9 @@ If the response comes back with `status` `queued` or `downloading` (HTTP 202), k
 | `GET /api/v1/downloads?limit=N` | Your downloads, newest first |
 | `POST /api/v1/info` | Metadata only |
 | `POST /api/v1/playlist` | Expand a playlist/channel into video URLs |
+| `POST /api/v1/downloads/{id}/transcript` | Transcribe a download. Body: `language` (`auto`/`en`/…), `wait`, `reuse`, `include_text` |
+| `GET /api/v1/downloads/{id}/transcript?wait=N` | Transcript status and text, optionally waiting |
+| `GET /api/v1/downloads/{id}/transcript.{txt,srt,vtt,json}` | Transcript file (needs the key) |
 | `GET /api/v1/health` | Health and versions (no key needed) |
 | `GET /openapi.json` | OpenAPI 3.1 spec (no key needed) |
 
@@ -116,7 +121,58 @@ Every error has the shape `{"error": {"code": "...", "message": "..."}}`. A fail
 | `rate_limited` | The site is throttling the server | Later |
 | `network_error` / `timeout` / `interrupted` | Transient | Yes |
 | `too_many_jobs` (HTTP 429) | Your key has too many downloads running | After one finishes |
-| `invalid_url` / `url_not_allowed` / `invalid_format` / `invalid_quality` | Fix the request | No |
+| `invalid_url` / `url_not_allowed` / `invalid_format` / `invalid_quality` / `invalid_language` | Fix the request | No |
+| `transcription_unavailable` (HTTP 501) | The server doesn't have transcription installed | No |
+
+## Transcripts
+
+ReClip can turn the speech in any download into text with OpenAI's Whisper models, run locally
+through [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (same models as
+`openai-whisper`, several times faster, no PyTorch). It's optional:
+
+```bash
+pip install -r requirements-transcribe.txt        # CPU
+pip install -r requirements-transcribe-cuda.txt   # NVIDIA GPU (adds the CUDA libraries; just needs a current driver)
+```
+
+The first transcript downloads the model from Hugging Face (`turbo` is about 1.6 GB) and caches it.
+Transcripts run one at a time so they don't fight over the GPU. If the GPU libraries can't load,
+ReClip falls back to the CPU on its own unless you pinned `RECLIP_WHISPER_DEVICE=cuda`.
+
+Over REST, add `"transcribe": true` to a download (use `"format": "mp3"` when you only want the
+words). The transcript starts as soon as the file is ready:
+
+```bash
+curl -s -X POST http://localhost:8899/api/v1/downloads \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"url": "https://www.youtube.com/watch?v=jNQXAC9IVRw", "format": "mp3", "transcribe": true, "wait": 120}'
+```
+
+The response carries a `transcript` object:
+
+```json
+"transcript": {
+  "download_id": "7db7b59fc8294dfa",
+  "status": "done",
+  "language": "en",
+  "duration": 19.1,
+  "model": "turbo",
+  "text": "All right, so here we are in front of the elephants...",
+  "files": {"txt": "https://…/files/7db7…/transcript.txt?expires=…&sig=…", "srt": "…", "vtt": "…", "json": "…"}
+}
+```
+
+If its `status` is `pending` (download still running), `queued` or `transcribing`, keep waiting with
+`GET /api/v1/downloads/{id}/transcript?wait=60`. To transcribe something already downloaded, call
+`POST /api/v1/downloads/{id}/transcript`. `json` has every segment with start/end timestamps;
+`srt`/`vtt` are ready-made subtitles. Transcript files are deleted along with the download.
+
+| Model (`RECLIP_WHISPER_MODEL`) | Good for |
+|---|---|
+| `turbo` (default) | Best speed/accuracy on a GPU; fine on a fast CPU |
+| `small` / `base` | Older or slower CPUs |
+| `large-v3` | Highest accuracy, slower; needs ~5 GB of GPU memory |
+| `*.en` variants (`small.en`, …) | English only, slightly more accurate for English |
 
 ## Configuration
 
@@ -136,6 +192,9 @@ Every error has the shape `{"error": {"code": "...", "message": "..."}}`. A fail
 | `RECLIP_MAX_PLAYLIST_ITEMS` | `200` | Cap for playlist expansion |
 | `RECLIP_ALLOW_PRIVATE_URLS` | `0` | Allow URLs on private/local networks (off to prevent SSRF) |
 | `RECLIP_SECRET` | random, saved in the download dir | Key for signing `file_url` links |
+| `RECLIP_WHISPER_MODEL` | `turbo` | Whisper model for transcripts (see [Transcripts](#transcripts)) |
+| `RECLIP_WHISPER_DEVICE` | `auto` | `auto` (GPU if available, else CPU), `cuda` or `cpu` |
+| `RECLIP_WHISPER_COMPUTE_TYPE` | `auto` | `float16` on GPU, `int8` on CPU; any CTranslate2 type works |
 
 ## Security notes
 

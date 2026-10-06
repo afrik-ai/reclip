@@ -1,6 +1,6 @@
 # ReClip
 
-A self-hosted, open-source video and audio downloader with a clean web UI. Paste links from YouTube, TikTok, Instagram, Twitter/X, and 1000+ other sites — download as MP4 or MP3.
+A self-hosted, open-source video and audio downloader with a clean web UI **and an API/MCP server so AI agents can use it too**. Paste links from YouTube, TikTok, Instagram, Twitter/X, and 1000+ other sites — download as MP4 or MP3.
 
 ![Python](https://img.shields.io/badge/python-3.8+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -17,7 +17,8 @@ https://github.com/user-attachments/assets/419d3e50-c933-444b-8cab-a9724986ba05
 - Bulk downloads — paste multiple URLs at once
 - Automatic URL deduplication
 - Clean, responsive UI — no frameworks, no build step
-- Single Python file backend (~150 lines)
+- **Agent-ready:** MCP server for Claude/Cursor, REST API with API keys, OpenAPI spec, signed download links
+- Download queue with a concurrency limit, persistent jobs, automatic file cleanup
 
 ## Quick Start
 
@@ -44,6 +45,29 @@ docker build -t reclip . && docker run -p 8899:8899 reclip
 4. Select quality/resolution if available
 5. Click **Download** on individual videos, or **Download All**
 
+## Use it from AI agents
+
+Give any agent a URL-to-file tool. With the MCP server (Claude Desktop, Claude Code, Cursor…):
+
+```bash
+pip install -r requirements.txt -r requirements-mcp.txt
+claude mcp add reclip -- python /path/to/reclip/mcp_server.py
+```
+
+Or over HTTP with an API key:
+
+```bash
+RECLIP_API_KEYS=my-secret-key docker compose up -d
+
+curl -X POST http://localhost:8899/api/v1/downloads \
+  -H "Authorization: Bearer my-secret-key" -H "Content-Type: application/json" \
+  -d '{"url": "https://www.youtube.com/watch?v=jNQXAC9IVRw", "format": "mp3", "wait": 60}'
+# → {"status": "done", "title": "...", "file_url": "http://localhost:8899/files/...", ...}
+```
+
+The full OpenAPI spec is served at `/openapi.json`. See [docs/agents.md](docs/agents.md) for all
+tools, endpoints, error codes and settings.
+
 ## Supported Sites
 
 Anything [yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md), including:
@@ -52,10 +76,17 @@ YouTube, TikTok, Instagram, Twitter/X, Reddit, Facebook, Vimeo, Twitch, Dailymot
 
 ## Stack
 
-- **Backend:** Python + Flask (~150 lines)
+- **Backend:** Python + Flask (`app.py`), download engine in `core.py`, MCP server in `mcp_server.py`
 - **Frontend:** Vanilla HTML/CSS/JS (single file, no build step)
 - **Download engine:** [yt-dlp](https://github.com/yt-dlp/yt-dlp) + [ffmpeg](https://ffmpeg.org/)
-- **Dependencies:** 2 (Flask, yt-dlp)
+- **Dependencies:** 2 (Flask, yt-dlp), plus `mcp` for the MCP server
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q tests        # end-to-end tests run real yt-dlp + ffmpeg against a local file
+```
 
 ## Disclaimer
 

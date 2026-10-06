@@ -1,210 +1,235 @@
+import hashlib
 import os
-import uuid
-import glob
-import json
-import subprocess
-import threading
-from flask import Flask, request, jsonify, send_file, render_template
+import secrets
+import sys
 
-app = Flask(__name__)
-DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+from flask import Flask, abort, jsonify, render_template, request, send_file
 
-jobs = {}
+from core import Engine, ReclipError, Settings, public_job
+from openapi import build_openapi
+
+API_VERSION = "1.0.0"
 
 
-def parse_ytdlp_json(stdout):
-    """Parse yt-dlp JSON output.
+def create_app(settings=None, engine=None):
+    settings = settings or (engine.settings if engine else Settings.from_env())
+    engine = engine or Engine(settings)
+    app = Flask(__name__)
+    app.config["RECLIP_ENGINE"] = engine
+    app.json.sort_keys = False
 
-    With ``-j`` yt-dlp prints one JSON object per line. Some extractors
-    emit multiple videos even with ``--no-playlist``, so stdout contains
-    several objects and a plain ``json.loads`` raises "Extra data".
-    Return the first valid object.
-    """
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        return json.loads(line)
-    raise ValueError("yt-dlp returned no data")
+    key_owners = {k: "key_" + hashlib.sha256(k.encode()).hexdigest()[:12] for k in settings.api_keys}
+
+    # ------------------------------------------------------------------ #
+    # helpers
+    # ------------------------------------------------------------------ #
+
+    def api_error(code, message, status):
+        return jsonify({"error": {"code": code, "message": message}}), status
+
+    @app.errorhandler(ReclipError)
+    def handle_reclip_error(e):
+        if request.path.startswith("/api/v1/") or request.path.startswith("/files/"):
+            return api_error(e.code, e.message, e.http_status)
+        # The bundled web UI expects {"error": "<message>"}.
+        return jsonify({"error": e.message}), e.http_status
+
+    def current_owner():
+        """Resolve the caller from its API key. Returns the owner id."""
+        if not key_owners:
+            return "local"
+        token = request.headers.get("X-API-Key", "")
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
+        for key, owner in key_owners.items():
+            if token and secrets.compare_digest(token.encode(), key.encode()):
+                return owner
+        raise ReclipError("unauthorized",
+                          "Missing or invalid API key (send 'Authorization: Bearer <key>')",
+                          http_status=401)
+
+    def base_url():
+        return settings.public_url or request.host_url.rstrip("/")
+
+    def file_url(job):
+        if job["status"] != "done":
+            return None
+        # Files kept forever (TTL 0) still get links that expire after a year.
+        exp = int(job["expires_at"] or (job["finished_at"] or 0) + 365 * 24 * 3600)
+        return f"{base_url()}/files/{job['id']}?expires={exp}&sig={engine.sign(job['id'], exp)}"
+
+    def job_json(job):
+        return public_job(job, file_url(job))
+
+    def body():
+        data = request.get_json(silent=True)
+        return data if isinstance(data, dict) else {}
+
+    def wait_seconds(value):
+        try:
+            return max(0.0, float(value or 0))
+        except (TypeError, ValueError):
+            raise ReclipError("invalid_request", "wait must be a number of seconds")
+
+    def send_job_file(job):
+        path = job.get("file_path")
+        if job["status"] != "done" or not path or not os.path.exists(path):
+            raise ReclipError("not_ready", f"File is not available (status: {job['status']})",
+                              http_status=409 if job["status"] in ("queued", "downloading") else 410)
+        return send_file(path, as_attachment=True, download_name=job["filename"])
+
+    # ------------------------------------------------------------------ #
+    # Agent API (v1)
+    # ------------------------------------------------------------------ #
+
+    @app.get("/api/v1/health")
+    def v1_health():
+        return jsonify({"ok": True, "version": API_VERSION, "auth_required": bool(key_owners),
+                        **engine.versions()})
+
+    @app.get("/openapi.json")
+    @app.get("/api/v1/openapi.json")
+    def v1_openapi():
+        return jsonify(build_openapi(base_url(), API_VERSION))
+
+    @app.post("/api/v1/info")
+    def v1_info():
+        current_owner()
+        return jsonify(engine.get_info(body().get("url")))
+
+    @app.post("/api/v1/playlist")
+    def v1_playlist():
+        current_owner()
+        data = body()
+        return jsonify(engine.expand_playlist(data.get("url"), data.get("limit")))
+
+    @app.post("/api/v1/downloads")
+    def v1_create_download():
+        owner = current_owner()
+        data = body()
+        wait = wait_seconds(data.get("wait", request.args.get("wait")))
+        job = engine.submit(
+            data.get("url"),
+            fmt=data.get("format", "mp4"),
+            quality=data.get("quality", "best"),
+            owner=owner,
+            reuse=data.get("reuse", True) is not False,
+        )
+        if wait:
+            job = {**engine.wait(job["id"], wait, owner), "cached": job.get("cached")}
+        status = 200 if job["status"] in ("done", "error") else 202
+        return jsonify(job_json(job)), status
+
+    @app.get("/api/v1/downloads")
+    def v1_list_downloads():
+        owner = current_owner()
+        try:
+            limit = int(request.args.get("limit", 50))
+        except ValueError:
+            raise ReclipError("invalid_request", "limit must be an integer")
+        return jsonify({"downloads": [job_json(j) for j in engine.list(owner, limit)]})
+
+    @app.get("/api/v1/downloads/<job_id>")
+    def v1_get_download(job_id):
+        owner = current_owner()
+        wait = wait_seconds(request.args.get("wait"))
+        job = engine.wait(job_id, wait, owner) if wait else engine.get(job_id, owner)
+        return jsonify(job_json(job))
+
+    @app.get("/api/v1/downloads/<job_id>/file")
+    def v1_download_file(job_id):
+        return send_job_file(engine.get(job_id, current_owner()))
+
+    @app.delete("/api/v1/downloads/<job_id>")
+    def v1_delete_download(job_id):
+        engine.delete(job_id, current_owner())
+        return "", 204
+
+    @app.get("/files/<job_id>")
+    def signed_file(job_id):
+        if not engine.verify_signature(job_id, request.args.get("expires"), request.args.get("sig")):
+            raise ReclipError("invalid_signature", "This link is invalid or has expired", http_status=403)
+        return send_job_file(engine.get(job_id))
+
+    @app.errorhandler(404)
+    def not_found(e):
+        if request.path.startswith("/api/v1/"):
+            return api_error("not_found", "No such endpoint", 404)
+        return e
+
+    @app.errorhandler(405)
+    def method_not_allowed(e):
+        if request.path.startswith("/api/v1/"):
+            return api_error("method_not_allowed", "Method not allowed", 405)
+        return e
+
+    # ------------------------------------------------------------------ #
+    # Web UI + the endpoints it calls (unchanged contract)
+    # ------------------------------------------------------------------ #
+
+    if settings.enable_ui:
+        @app.route("/")
+        def index():
+            return render_template("index.html")
+
+        @app.post("/api/info")
+        def get_info():
+            info = engine.get_info(body().get("url", ""))
+            return jsonify({k: info[k] for k in ("title", "thumbnail", "duration", "uploader", "formats")})
+
+        @app.post("/api/playlist")
+        def get_playlist_info():
+            result = engine.expand_playlist(body().get("url", ""))
+            return jsonify({"urls": [item["url"] for item in result["items"]]})
+
+        @app.post("/api/download")
+        def start_download():
+            data = body()
+            job = engine.submit(
+                data.get("url", ""),
+                fmt=data.get("format", "video"),
+                owner="ui",
+                format_id=data.get("format_id") or None,
+                title=data.get("title") or None,
+                reuse=False,
+                enforce_limit=False,
+            )
+            return jsonify({"job_id": job["id"]})
+
+        @app.get("/api/status/<job_id>")
+        def check_status(job_id):
+            job = engine.get(job_id, "ui")
+            status = {"queued": "downloading", "expired": "error"}.get(job["status"], job["status"])
+            error = job["error_message"] if job["status"] == "error" else (
+                "File expired" if job["status"] == "expired" else None)
+            return jsonify({"status": status, "error": error, "filename": job["filename"],
+                            "progress": job["progress"]})
+
+        @app.get("/api/file/<job_id>")
+        def download_file(job_id):
+            try:
+                return send_job_file(engine.get(job_id, "ui"))
+            except ReclipError:
+                return jsonify({"error": "File not ready"}), 404
+
+    return app
 
 
-def run_download(job_id, url, format_choice, format_id):
-    job = jobs[job_id]
-    out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
-
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
-
-    if format_choice == "audio":
-        cmd += ["-x", "--audio-format", "mp3"]
-    elif format_id:
-        cmd += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
-    else:
-        cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
-
-    cmd.append(url)
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            job["status"] = "error"
-            job["error"] = result.stderr.strip().split("\n")[-1]
-            return
-
-        files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
-        if not files:
-            job["status"] = "error"
-            job["error"] = "Download completed but no file was found"
-            return
-
-        if format_choice == "audio":
-            target = [f for f in files if f.endswith(".mp3")]
-            chosen = target[0] if target else files[0]
-        else:
-            target = [f for f in files if f.endswith(".mp4")]
-            chosen = target[0] if target else files[0]
-
-        for f in files:
-            if f != chosen:
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
-
-        job["status"] = "done"
-        job["file"] = chosen
-        ext = os.path.splitext(chosen)[1]
-        title = job.get("title", "").strip()
-        # Sanitize title for filename
-        if title:
-            safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:100].strip()
-            job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
-        else:
-            job["filename"] = os.path.basename(chosen)
-    except subprocess.TimeoutExpired:
-        job["status"] = "error"
-        job["error"] = "Download timed out (5 min limit)"
-    except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
-
-
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-@app.route("/api/info", methods=["POST"])
-def get_info():
-    data = request.json
-    url = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    cmd = ["yt-dlp", "--no-playlist", "-j", url]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
-
-        info = parse_ytdlp_json(result.stdout)
-
-        # Build quality options — keep best format per resolution
-        best_by_height = {}
-        for f in info.get("formats", []):
-            height = f.get("height")
-            if height and f.get("vcodec", "none") != "none":
-                tbr = f.get("tbr") or 0
-                if height not in best_by_height or tbr > (best_by_height[height].get("tbr") or 0):
-                    best_by_height[height] = f
-
-        formats = []
-        for height, f in best_by_height.items():
-            formats.append({
-                "id": f["format_id"],
-                "label": f"{height}p",
-                "height": height,
-            })
-        formats.sort(key=lambda x: x["height"], reverse=True)
-
-        return jsonify({
-            "title": info.get("title", ""),
-            "thumbnail": info.get("thumbnail", ""),
-            "duration": info.get("duration"),
-            "uploader": info.get("uploader", ""),
-            "formats": formats,
-        })
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out fetching video info"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/api/playlist", methods=["POST"])
-def get_playlist_info():
-    data = request.json
-    url = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    cmd = ["yt-dlp", "--flat-playlist", "-J", url]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
-
-        info = json.loads(result.stdout)
-        entries = info.get("entries", [])
-        urls = [entry.get("url") for entry in entries if entry.get("url")]
-        return jsonify({"urls": urls})
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out fetching playlist info"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/api/download", methods=["POST"])
-def start_download():
-    data = request.json
-    url = data.get("url", "").strip()
-    format_choice = data.get("format", "video")
-    format_id = data.get("format_id")
-    title = data.get("title", "")
-
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
-
-    thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
-    thread.daemon = True
-    thread.start()
-
-    return jsonify({"job_id": job_id})
-
-
-@app.route("/api/status/<job_id>")
-def check_status(job_id):
-    job = jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Job not found"}), 404
-    return jsonify({
-        "status": job["status"],
-        "error": job.get("error"),
-        "filename": job.get("filename"),
-    })
-
-
-@app.route("/api/file/<job_id>")
-def download_file(job_id):
-    job = jobs.get(job_id)
-    if not job or job["status"] != "done":
-        return jsonify({"error": "File not ready"}), 404
-    return send_file(job["file"], as_attachment=True, download_name=job["filename"])
+def __getattr__(name):
+    # `gunicorn app:app` keeps working, but importing this module (tests, the
+    # MCP server) doesn't spin up a download engine as a side effect.
+    if name == "app":
+        globals()["app"] = create_app()
+        return globals()["app"]
+    raise AttributeError(name)
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8899))
     host = os.environ.get("HOST", "127.0.0.1")
-    app.run(host=host, port=port)
+    application = create_app()
+    if host not in ("127.0.0.1", "localhost", "::1") and not os.environ.get("RECLIP_API_KEYS"):
+        print("WARNING: ReClip is listening on a public interface without RECLIP_API_KEYS; "
+              "anyone who can reach it can use it.", file=sys.stderr)
+    application.run(host=host, port=port, threaded=True)

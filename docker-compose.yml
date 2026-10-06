@@ -5,6 +5,14 @@ services:
     container_name: reclip
     ports:
       - "8899:8899"
+    environment:
+      # Comma-separated keys agents must send as "Authorization: Bearer <key>".
+      # Generate one with: openssl rand -hex 24
+      RECLIP_API_KEYS: ${RECLIP_API_KEYS:-}
+      # Public base URL used in returned file_url links (e.g. https://reclip.example.com).
+      RECLIP_PUBLIC_URL: ${RECLIP_PUBLIC_URL:-}
+      RECLIP_FILE_TTL_HOURS: ${RECLIP_FILE_TTL_HOURS:-24}
+      RECLIP_MAX_CONCURRENT: ${RECLIP_MAX_CONCURRENT:-3}
     volumes:
       - reclip-downloads:/app/downloads
     restart: unless-stopped

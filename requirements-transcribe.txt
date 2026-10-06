@@ -1,3 +1,6 @@
 # Optional: transcripts of downloaded media (Whisper models via faster-whisper).
 # The first transcript downloads the model (turbo is about 1.6 GB) from Hugging Face.
 faster-whisper>=1.1
+# PyAV 19 dropped the metadata_errors argument faster-whisper 1.2.1 still passes,
+# which fails every transcript ("unexpected keyword argument 'metadata_errors'").
+av<19

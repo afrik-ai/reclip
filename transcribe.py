@@ -173,7 +173,8 @@ def write_outputs(result, out_dir, stem="transcript"):
     paths = {}
     for fmt in TRANSCRIPT_FORMATS:
         path = os.path.join(out_dir, f"{stem}.{fmt}")
-        with open(path, "w", encoding="utf-8") as f:
+        # newline="\n": keep LF on Windows too, so files match across platforms.
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(contents[fmt])
         paths[fmt] = path
     return paths

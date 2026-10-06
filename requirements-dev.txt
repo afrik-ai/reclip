@@ -1,3 +1,4 @@
 -r requirements.txt
 -r requirements-mcp.txt
+-r requirements-transcribe.txt
 pytest

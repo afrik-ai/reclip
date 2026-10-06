@@ -59,6 +59,21 @@ def test_transcriber_output_and_formats(tmp_path):
     assert "2\n00:01:01,500 --> 01:02:05,040\nGeneral Kenobi!\n" in srt
     assert open(paths["vtt"], encoding="utf-8").read().startswith("WEBVTT\n\n00:00:00.000 --> ")
     assert open(paths["txt"], encoding="utf-8").read() == "Hello there.\nGeneral Kenobi!\n"
+    for path in paths.values():  # LF everywhere, Windows included
+        assert b"\r" not in open(path, "rb").read()
+
+
+@needs_ffmpeg
+def test_faster_whisper_decodes_mp3(tmp_path):
+    """Catches PyAV releases that break faster-whisper's audio loading."""
+    audio = pytest.importorskip("faster_whisper.audio")
+    import subprocess
+
+    mp3 = tmp_path / "tone.mp3"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440",
+                    "-t", "1", str(mp3)], check=True)
+    samples = audio.decode_audio(str(mp3))
+    assert 15000 < len(samples) < 17000  # 1 s at 16 kHz
 
 
 def test_gpu_falls_back_to_cpu_when_cuda_libraries_are_missing(monkeypatch):

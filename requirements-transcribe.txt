@@ -1,0 +1,3 @@
+# Optional: transcripts of downloaded media (Whisper models via faster-whisper).
+# The first transcript downloads the model (turbo is about 1.6 GB) from Hugging Face.
+faster-whisper>=1.1

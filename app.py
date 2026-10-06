@@ -2,10 +2,12 @@ import hashlib
 import os
 import secrets
 import sys
+import time
 
 from flask import Flask, abort, jsonify, render_template, request, send_file
 
-from core import Engine, ReclipError, Settings, public_job
+from core import (TRANSCRIPT_ACTIVE, Engine, ReclipError, Settings, normalize_language, public_job,
+                  public_transcript)
 from openapi import build_openapi
 
 API_VERSION = "1.0.0"
@@ -62,6 +64,41 @@ def create_app(settings=None, engine=None):
     def job_json(job):
         return public_job(job, file_url(job))
 
+    def transcript_json(transcript, include_text=True):
+        job_id = transcript["job_id"]
+        if transcript["status"] != "done":
+            return public_transcript(transcript)
+        job = engine.store.get(job_id) or {"expires_at": None, "finished_at": time.time()}
+        exp = int(job["expires_at"] or (job["finished_at"] or 0) + 365 * 24 * 3600)
+        files = {}
+        for fmt in engine.transcript_paths(job_id):
+            name = f"transcript.{fmt}"
+            sig = engine.sign(f"{job_id}/{name}", exp)
+            files[fmt] = f"{base_url()}/files/{job_id}/{name}?expires={exp}&sig={sig}"
+        text = engine.read_transcript_text(job_id) if include_text else None
+        return public_transcript(transcript, text, files)
+
+    def send_transcript_file(job_id, fmt):
+        paths = engine.transcript_paths(job_id)
+        transcript = engine.store.get_transcript(job_id)
+        if fmt not in paths:
+            raise ReclipError("invalid_format", "format must be one of: " + ", ".join(paths))
+        if not transcript or transcript["status"] != "done" or not os.path.exists(paths[fmt]):
+            raise ReclipError("not_ready", "Transcript is not available", http_status=409)
+        mimetypes = {"txt": "text/plain", "srt": "application/x-subrip", "vtt": "text/vtt",
+                     "json": "application/json"}
+        job = engine.store.get(job_id)
+        stem = os.path.splitext(job["filename"] or "transcript")[0]
+        return send_file(paths[fmt], mimetype=mimetypes[fmt] + "; charset=utf-8",
+                         as_attachment=True, download_name=f"{stem}.{fmt}")
+
+    def flag(value, default=True):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() not in ("0", "false", "no", "off")
+
     def body():
         data = request.get_json(silent=True)
         return data if isinstance(data, dict) else {}
@@ -106,9 +143,18 @@ def create_app(settings=None, engine=None):
 
     @app.post("/api/v1/downloads")
     def v1_create_download():
+        started = time.time()
         owner = current_owner()
         data = body()
         wait = wait_seconds(data.get("wait", request.args.get("wait")))
+        want_transcript = flag(data.get("transcribe"), default=False)
+        if want_transcript:
+            # Fail before starting a download nobody asked for on its own.
+            normalize_language(data.get("language"))
+            if not engine.transcription_available():
+                raise ReclipError("transcription_unavailable",
+                                  "Transcription isn't installed on this server "
+                                  "(pip install -r requirements-transcribe.txt)", http_status=501)
         job = engine.submit(
             data.get("url"),
             fmt=data.get("format", "mp4"),
@@ -116,10 +162,22 @@ def create_app(settings=None, engine=None):
             owner=owner,
             reuse=data.get("reuse", True) is not False,
         )
+        transcript = None
+        if want_transcript:
+            transcript = engine.request_transcript(job["id"], owner, data.get("language"))
         if wait:
             job = {**engine.wait(job["id"], wait, owner), "cached": job.get("cached")}
         status = 200 if job["status"] in ("done", "error") else 202
-        return jsonify(job_json(job)), status
+        out = job_json(job)
+        if transcript:
+            # The download used part of the wait; give the rest to the transcript.
+            remaining = max(0.0, wait - (time.time() - started)) if wait else 0
+            transcript = engine.wait_transcript(job["id"], remaining, owner) if remaining else \
+                engine.get_transcript(job["id"], owner)
+            out["transcript"] = transcript_json(transcript)
+            if transcript["status"] in TRANSCRIPT_ACTIVE:
+                status = 202
+        return jsonify(out), status
 
     @app.get("/api/v1/downloads")
     def v1_list_downloads():
@@ -145,6 +203,38 @@ def create_app(settings=None, engine=None):
     def v1_delete_download(job_id):
         engine.delete(job_id, current_owner())
         return "", 204
+
+    @app.post("/api/v1/downloads/<job_id>/transcript")
+    def v1_create_transcript(job_id):
+        owner = current_owner()
+        data = body()
+        wait = wait_seconds(data.get("wait", request.args.get("wait")))
+        transcript = engine.request_transcript(job_id, owner, data.get("language"),
+                                               reuse=data.get("reuse", True) is not False)
+        if wait:
+            transcript = engine.wait_transcript(job_id, wait, owner)
+        status = 202 if transcript["status"] in TRANSCRIPT_ACTIVE else 200
+        return jsonify(transcript_json(transcript, flag(data.get("include_text")))), status
+
+    @app.get("/api/v1/downloads/<job_id>/transcript")
+    def v1_get_transcript(job_id):
+        owner = current_owner()
+        wait = wait_seconds(request.args.get("wait"))
+        transcript = engine.wait_transcript(job_id, wait, owner) if wait else \
+            engine.get_transcript(job_id, owner)
+        return jsonify(transcript_json(transcript, flag(request.args.get("include_text"))))
+
+    @app.get("/api/v1/downloads/<job_id>/transcript.<fmt>")
+    def v1_transcript_file(job_id, fmt):
+        engine.get(job_id, current_owner())
+        return send_transcript_file(job_id, fmt)
+
+    @app.get("/files/<job_id>/transcript.<fmt>")
+    def signed_transcript_file(job_id, fmt):
+        if not engine.verify_signature(f"{job_id}/transcript.{fmt}", request.args.get("expires"),
+                                       request.args.get("sig")):
+            raise ReclipError("invalid_signature", "This link is invalid or has expired", http_status=403)
+        return send_transcript_file(job_id, fmt)
 
     @app.get("/files/<job_id>")
     def signed_file(job_id):

@@ -18,6 +18,7 @@ https://github.com/user-attachments/assets/419d3e50-c933-444b-8cab-a9724986ba05
 - Automatic URL deduplication
 - Clean, responsive UI — no frameworks, no build step
 - **Agent-ready:** MCP server for Claude/Cursor, REST API with API keys, OpenAPI spec, signed download links
+- **Transcripts (optional):** turn any download into text and subtitles with Whisper, on your GPU or CPU
 - Download queue with a concurrency limit, persistent jobs, automatic file cleanup
 
 ## Quick Start
